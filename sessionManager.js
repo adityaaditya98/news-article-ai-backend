@@ -6,10 +6,10 @@ const { createClient } = redis;
 
 const client = createClient({
     username: 'default',
-    password: 'cgvpGFBUKJjjMVprEyAHE3qzcQbjkOkt',
+    password: process.env.Password_redis,
     socket: {
-        host: 'redis-14212.c240.us-east-1-3.ec2.redns.redis-cloud.com',
-        port: 14212
+        host: process.env.Host_redis,
+        port: process.env.Port_redis
     }
 });
 (async () => {
