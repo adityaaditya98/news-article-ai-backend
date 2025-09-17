@@ -3,7 +3,8 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
 dotenv.config();
-
+const cors = require("cors");
+const cron = require("node-cron");
 const { createSession, getSession, appendToSession, clearSession ,getAllKeys } = require("./sessionManager");
 const { fetchArticles, initCollection, ingestToQdrant, retrieveTopK, buildPromptWithHistory, askModel } = require("./reg");
 
@@ -12,6 +13,12 @@ app.use(bodyParser.json());
 
 // Health
 app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+app.use(cors({
+  origin: "https://adityaboddu.netlify.app", // or ["http://localhost:3000", "https://yourfrontend.com"]
+  methods: "GET,POST,DELETE,PUT",
+  credentials: true
+}));
 
 // Create new session
 app.post("/sessions", async (req, res) => {
@@ -50,6 +57,17 @@ app.delete("/sessions/:id", async (req, res) => {
 });
 
 // Ingest endpoint (run RSS ingest -> embeddings -> Qdrant). Call manually or from cron.
+cron.schedule("0 9 * * *", async () => {
+  try {
+    const articles = await fetchArticles();
+    await initCollection();
+    await ingestToQdrant(articles);
+    res.json({ status: "ok", ingested: articles.length });
+  } catch (err) {
+    console.error("ingest err:", err);
+    res.status(500).json({ error: "failed to ingest" });
+  }
+});
 app.post("/ingest", async (req, res) => {
   try {
     const articles = await fetchArticles();
@@ -95,7 +113,7 @@ app.get("/getAll", async (req, res) => {
 })
 
 // Start server
-const PORT = process.env.PORT || 3000;
+const PORT = 3001;
 app.listen(PORT, () => {
   console.log(`RAG server running on http://localhost:${PORT}`);
 });
