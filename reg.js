@@ -10,7 +10,9 @@ dotenv.config();
 const RSS_FEEDS = [
   "https://feeds.bbci.co.uk/news/world/rss.xml",
   "https://www.theguardian.com/world/rss",
-  "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
+  "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+  "https://www.indiatoday.in/rss/1206577.xml",
+  "https://www.aljazeera.com/xml/rss/all.xml"
 ];
 
 const JINA_EMBED_URL = "https://api.jina.ai/v1/embeddings";
@@ -39,7 +41,7 @@ function simpleHash(s) {
 }
 
 // --- Ingest articles (fetch RSS pages, embed, push to Qdrant) ---
-async function fetchArticles(limit = 50) {
+async function fetchArticles(limit = 100) {
   const parser = new Parser();
   let articles = [];
   for (const url of RSS_FEEDS) {

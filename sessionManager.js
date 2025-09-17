@@ -2,10 +2,26 @@
 const redis = require("redis");
 const dotenv = require("dotenv");
 dotenv.config();
+const { createClient } = redis;
 
-const client = redis.createClient({ url: process.env.REDIS_URL });
-client.on("error", (err) => console.error("Redis Client Error", err));
-client.connect().catch(console.error);
+const client = createClient({
+    username: 'default',
+    password: 'cgvpGFBUKJjjMVprEyAHE3qzcQbjkOkt',
+    socket: {
+        host: 'redis-14212.c240.us-east-1-3.ec2.redns.redis-cloud.com',
+        port: 14212
+    }
+});
+(async () => {
+    client.on('error', err => console.log('Redis Client Error', err));
+
+await client.connect();
+
+await client.set('foo', 'bar');
+const result = await client.get('foo');
+console.log(result) 
+})();
+
 
 const SESSION_TTL = parseInt(process.env.SESSION_TTL_SECONDS || "1800", 10);
 
@@ -51,6 +67,11 @@ async function cacheGet(key) {
   return v ? JSON.parse(v) : null;
 }
 
+async function getAllKeys() {
+  const keys = (await client.keys('*')).filter(key => (!(key.includes("embed:") || key.includes("retrieve:"))&& key.length>=5));
+  return keys;
+}
+
 module.exports = {
   createSession,
   getSession,
@@ -59,5 +80,6 @@ module.exports = {
   clearSession,
   cacheSet,
   cacheGet,
+  getAllKeys,
   redisClient: client
 };

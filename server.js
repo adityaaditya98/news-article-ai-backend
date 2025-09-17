@@ -4,7 +4,7 @@ const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
 dotenv.config();
 
-const { createSession, getSession, appendToSession, clearSession } = require("./sessionManager");
+const { createSession, getSession, appendToSession, clearSession ,getAllKeys } = require("./sessionManager");
 const { fetchArticles, initCollection, ingestToQdrant, retrieveTopK, buildPromptWithHistory, askModel } = require("./reg");
 
 const app = express();
@@ -76,7 +76,7 @@ app.post("/sessions/:id/chat", async (req, res) => {
 
     // Build prompt from history + passages
     const prompt = buildPromptWithHistory(history, query, passages);
-
+    console.log("Prompt:", prompt);
     // Ask model
     const answer = await askModel(prompt);
 
@@ -89,6 +89,10 @@ app.post("/sessions/:id/chat", async (req, res) => {
     res.status(500).json({ error: "chat failed", detail: err.response?.data || err.message });
   }
 });
+app.get("/getAll", async (req, res) => {
+  const allKeys = await getAllKeys();
+  res.json({ Keys: allKeys });
+})
 
 // Start server
 const PORT = process.env.PORT || 3000;
