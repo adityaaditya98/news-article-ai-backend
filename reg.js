@@ -117,7 +117,8 @@ async function retrieveTopK(query, k = 5) {
 function buildPromptWithHistory(history, query, passages) {
   const histText = (history || []).map((h, i) => `Q${i + 1}: ${h.query}\nA${i + 1}: ${h.answer}`).join("\n");
   const context = passages.map((p, i) => `[Passage ${i + 1}]\nTitle: ${p.title}\nContent: ${p.content}`).join("\n\n");
-  return `${histText ? "Conversation so far:\n" + histText + "\n\n" : ""}Context:\n${context}\n\nUser: ${query}\n\nInstructions:\n1) Use only the passages above and conversation history.\n2) Be concise and don't invent facts.\n3) If answer is not in context, reply: "Information not available in the retrieved passages."\n\nAnswer:`;
+  return `${histText ? "Conversation so far:\n" + histText + "\n\n" : ""}Context:\n${context}\n\nUser: ${query}\n\nInstructions:\n1) Use only the passages above and conversation history.\n2) Be concise and don't invent facts.\n3) If answer is not in context, reply: "Information not available in the retrieved passages."\n4) If user query is a general/basic message (e.g., greetings, small talk like 'how are you'), reply politely in a conversational way.\n\nAnswer:`;
+
 }
 
 // Ask Gemini (or text-bison fallback) with prompt
