@@ -170,29 +170,92 @@ jobs:
             echo "}" >> payload.json
           fi
 
-          # Upload using file input to avoid long-argument errors
-          HTTP_CODE_FILE=$(mktemp)
-          curl -sS --max-time 180 --connect-timeout 30 -X POST "${API_URL}/scans/trigger" \
-            -H "Authorization: Bearer ${API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d @payload.json -o response.json -w "%{http_code}" >"$HTTP_CODE_FILE" 2>curl.err
-          CURL_EXIT=$?
-          HTTP_CODE=$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "")
-          rm -f "$HTTP_CODE_FILE"
+          # Retry upload with exponential backoff; switch to reduced SBOM after 2 failures
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+          ATTEMPT=1
+          UPLOAD_SUCCESS=0
 
-          if [ $CURL_EXIT -ne 0 ]; then
-            echo "❌ curl failed with exit code $CURL_EXIT"
-            echo "-- curl stderr --"
-            sed -n '1,200p' curl.err || true
-            exit 1
-          fi
+          while [ $ATTEMPT -le $MAX_RETRIES ] && [ $UPLOAD_SUCCESS -eq 0 ]; do
+            echo ""
+            echo "🔄 Upload attempt $ATTEMPT of $MAX_RETRIES"
 
-          echo "HTTP Status: ${HTTP_CODE:-(none)}"
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
-            echo "✅ SBOM uploaded successfully!"
-          else
-            echo "❌ Failed to upload SBOM to backend (HTTP $HTTP_CODE)"
+            # Choose full or reduced SBOM depending on attempt
+            if [ $ATTEMPT -gt 2 ] && [ -s sbom-reduced.json ]; then
+              USE_SBOM=sbom-reduced.json
+              echo "ℹ️ Using reduced SBOM: $USE_SBOM"
+            else
+              USE_SBOM=sbom.json
+            fi
+
+            # Recreate payload for this attempt (so we can switch sbom file)
+            if command -v jq &> /dev/null; then
+              jq -n \
+                --arg repository "${{ github.repository }}" \
+                --arg version "${{ steps.version.outputs.version }}" \
+                --arg git_tag "${{ steps.version.outputs.git_tag }}" \
+                --arg git_commit_sha "${{ steps.version.outputs.git_commit_sha }}" \
+                --slurpfile sbom "$USE_SBOM" \
+                '{repository_name:$repository,version:$version,git_tag:$git_tag,git_commit_sha:$git_commit_sha,sbom_data:$sbom[0]}' \
+                > payload.json || {
+                echo "⚠️ Failed to create payload.json with jq"
+              }
+            else
+              printf '%s\n' '{' \
+                "  \"repository_name\": \"${{ github.repository }}\"," \
+                "  \"version\": \"${{ steps.version.outputs.version }}\"," \
+                "  \"git_tag\": \"${{ steps.version.outputs.git_tag }}\"," \
+                "  \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\"," \
+                "  \"sbom_data\": " > payload.json
+              cat "$USE_SBOM" >> payload.json
+              echo "}" >> payload.json
+            fi
+
+            HTTP_CODE_FILE=$(mktemp)
+            curl -sS --max-time 180 --connect-timeout 30 -X POST "${API_URL}/scans/trigger" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d @payload.json -o response.json -w "%{http_code}" >"$HTTP_CODE_FILE" 2>curl.err
+            CURL_EXIT=$?
+            HTTP_CODE=$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "")
+            rm -f "$HTTP_CODE_FILE"
+
+            if [ $CURL_EXIT -ne 0 ]; then
+              echo "⚠️ curl failed with exit code $CURL_EXIT"
+              sed -n '1,200p' curl.err || true
+            fi
+
+            echo "HTTP Status: ${HTTP_CODE:-(none)}"
+
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
+              echo "✅ SBOM uploaded successfully on attempt $ATTEMPT"
+              UPLOAD_SUCCESS=1
+              break
+            fi
+
+            # Retry on common server errors or timeout
+            if [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "408" ] || [ $CURL_EXIT -ne 0 ]; then
+              if [ $ATTEMPT -lt $MAX_RETRIES ]; then
+                echo "⚠️ Server/connection error (HTTP $HTTP_CODE), retrying after ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+                RETRY_DELAY=$((RETRY_DELAY * 2))
+                ATTEMPT=$((ATTEMPT + 1))
+                continue
+              else
+                echo "❌ Exhausted retries (last HTTP $HTTP_CODE)"
+                echo "-- Response preview --"
+                head -c 500 response.json || true
+                exit 1
+              fi
+            fi
+
+            # For other non-retriable errors (4xx), fail immediately
+            echo "❌ Upload failed with HTTP $HTTP_CODE (non-retriable)"
             echo "-- Response preview --"
-            head -c 200 response.json || true
+            head -c 500 response.json || true
             exit 1
+          done
+
+          if [ $UPLOAD_SUCCESS -eq 1 ]; then
+            echo "✅ SBOM successfully uploaded to backend!"
           fi
