@@ -1,0 +1,164 @@
+name: SBOM Scan
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # Restrict to specific branches for extra security
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for tags
+      
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+      
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.ref_type }}" == "tag" ]; then
+            # If scanning a git tag, use the tag name (highest priority)
+            VERSION="${{ github.ref_name }}"
+            GIT_TAG="${{ github.ref_name }}"
+            echo "✅ Using version from git tag: $VERSION"
+          elif [ -f "package.json" ]; then
+            # Try to read version from package.json
+            if command -v jq &> /dev/null; then
+              VERSION=$(jq -r '.version' package.json 2>/dev/null || echo "")
+            else
+              # Fallback: use grep/sed if jq is not available
+              VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' package.json | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || echo "")
+            fi
+            
+            # Validate version was found and is not null/empty
+            if [ -z "$VERSION" ] || [ "$VERSION" == "null" ]; then
+              echo "⚠️ Warning: No version found in package.json, using commit-based version"
+              VERSION="main-$(git rev-parse --short HEAD)"
+            else
+              echo "✅ Using version from package.json: $VERSION"
+            fi
+            GIT_TAG=""
+          else
+            # Fallback: use commit-based version
+            VERSION="main-$(git rev-parse --short HEAD)"
+            GIT_TAG=""
+            echo "ℹ️ No package.json found, using commit-based version: $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "git_tag=$GIT_TAG" >> $GITHUB_OUTPUT
+          echo "git_commit_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+      
+      - name: Setup Node.js (if package.json exists)
+        if: hashFiles('**/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install npm dependencies (if package.json exists)
+        if: hashFiles('**/package.json') != ''
+        run: |
+          # Find all package.json files and install dependencies
+          # We need package-lock.json for syft to detect packages
+          find . -name "package.json" -not -path "*/node_modules/*" -print0 | while IFS= read -r -d '' pkg; do
+            PKG_DIR=$(dirname "$pkg")
+            (cd "$PKG_DIR" && npm install --no-audit --no-fund) || {
+              echo "⚠️ Warning: npm install failed in $PKG_DIR"
+            }
+          done
+      
+      - name: Setup Python (if requirements.txt exists)
+        if: hashFiles('**/requirements.txt') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Generate SBOM
+        id: sbom
+        run: |
+          # Create .syftignore file to exclude non-package directories
+          cat > .syftignore << EOF
+          .github/
+          .git/
+          .next/
+          out/
+          __pycache__/
+          *.pyc
+          .venv/
+          venv/
+          .env*
+          EOF
+          
+          # Scan the entire directory - syft will auto-detect npm packages from package-lock.json
+          syft scan dir:. --scope all-layers -o cyclonedx-json > sbom.json 2>syft-warnings.log || {
+            echo "❌ Syft scan failed"
+            cat syft-warnings.log || true
+            exit 1
+          }
+          
+          # Validate JSON is valid
+          if [ ! -s sbom.json ] || ! jq empty sbom.json 2>/dev/null; then
+            echo "❌ Error: Generated SBOM is not valid JSON"
+            if [ -s syft-warnings.log ]; then
+              cat syft-warnings.log
+            fi
+            exit 1
+          fi
+      
+      - name: Upload SBOM to Backend
+        env:
+          # Secrets are automatically masked in logs
+          API_TOKEN: ${{ secrets.OSS_API_TOKEN }}
+          API_URL: ${{ secrets.OSS_API_URL }}
+        run: |
+          # Validate API_URL is set and properly formatted
+          if [ -z "$API_URL" ]; then
+            echo "❌ Error: OSS_API_URL secret is not set"
+            exit 1
+          fi
+          
+          # Remove trailing slash if present
+          API_URL=$(echo "$API_URL" | sed 's:/*$::')
+          
+          # Validate URL format (must start with http:// or https://)
+          if [[ ! "$API_URL" =~ ^https?:// ]]; then
+            echo "❌ Error: OSS_API_URL must start with http:// or https://"
+            echo "Current value: $API_URL"
+            exit 1
+          fi
+          
+          # Validate API_TOKEN is set
+          if [ -z "$API_TOKEN" ]; then
+            echo "❌ Error: OSS_API_TOKEN secret is not set"
+            exit 1
+          fi
+          
+          echo "✅ API URL: ${API_URL}"
+          echo "✅ API Token: ${API_TOKEN:0:10}... (masked)"
+          echo "✅ Repository: ${{ github.repository }}"
+          echo "✅ Version: ${{ steps.version.outputs.version }}"
+          
+          # GitHub automatically masks the token if it appears in output
+          curl -X POST "${API_URL}/scans/trigger" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -f \
+            -w "\nHTTP Status: %{http_code}\n" \
+            -d "{
+              \"repository_name\": \"${{ github.repository }}\",
+              \"version\": \"${{ steps.version.outputs.version }}\",
+              \"git_tag\": \"${{ steps.version.outputs.git_tag }}\",
+              \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\",
+              \"sbom_data\": $(cat sbom.json)
+            }" || {
+              echo "❌ Failed to upload SBOM to backend"
+              exit 1
+            }
+          
+          echo "✅ SBOM uploaded successfully!"
