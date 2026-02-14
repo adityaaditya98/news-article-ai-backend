@@ -144,24 +144,49 @@ jobs:
           echo "✅ Repository: ${{ github.repository }}"
           echo "✅ Version: ${{ steps.version.outputs.version }}"
           
-          # Debug: Check SBOM file size
-          echo "📊 SBOM file size: $(du -h sbom.json | cut -f1)"
+          # Test endpoint connectivity first
+          echo ""
+          echo "🔍 Testing endpoint connectivity..."
+          curl -s -o /dev/null -w "Connection test - HTTP Status: %{http_code}\n" \
+            --connect-timeout 10 \
+            --max-time 15 \
+            "${API_URL}/health" || echo "⚠️ Health check endpoint unavailable (expected if not implemented)"
+          
+          # Debug: Check SBOM file structure
+          echo ""
+          echo "📊 SBOM file size: $(du -h sbom.json 2>/dev/null | cut -f1 || echo 'N/A')"
           echo "📊 SBOM file line count: $(wc -l < sbom.json)"
           
-          # Check if SBOM is too large and minify if needed
+          # Check if SBOM is too large and minify
           SBOM_SIZE=$(stat -f%z sbom.json 2>/dev/null || stat -c%s sbom.json 2>/dev/null)
           echo "📊 SBOM exact size: $SBOM_SIZE bytes"
           
-          # If SBOM is larger than 10MB, minify it
-          if [ "$SBOM_SIZE" -gt 10485760 ]; then
-            echo "⚠️ SBOM size exceeds 10MB, minifying..."
-            jq -c . sbom.json > sbom.min.json
-            mv sbom.min.json sbom.json
-            SBOM_SIZE=$(stat -f%z sbom.json 2>/dev/null || stat -c%s sbom.json 2>/dev/null)
-            echo "📊 Minified SBOM size: $SBOM_SIZE bytes"
-          fi
+          # Minify SBOM to reduce payload
+          echo "🔧 Minifying SBOM..."
+          jq -c . sbom.json > sbom.min.json
+          mv sbom.min.json sbom.json
+          SBOM_SIZE=$(stat -f%z sbom.json 2>/dev/null || stat -c%s sbom.json 2>/dev/null)
+          echo "📊 Minified SBOM size: $SBOM_SIZE bytes"
           
-          # Create payload with SBOM to avoid "Argument list too long" error
+          # Extract only essential SBOM metadata to reduce size further if needed
+          echo "🔧 Creating reduced SBOM with essential components..."
+          jq '{
+            "bomFormat": .bomFormat,
+            "specVersion": .specVersion,
+            "version": .version,
+            "metadata": {
+              "timestamp": .metadata.timestamp,
+              "tools": .metadata.tools[0:1]
+            },
+            "components": (.components | sort_by(.name)[:50])
+          }' sbom.json > sbom-reduced.json
+          
+          REDUCED_SIZE=$(stat -f%z sbom-reduced.json 2>/dev/null || stat -c%s sbom-reduced.json 2>/dev/null)
+          echo "📊 Reduced SBOM size (first 50 components): $REDUCED_SIZE bytes"
+          
+          # Create full payload
+          echo ""
+          echo "🔧 Creating full payload..."
           cat > payload.json << 'PAYLOAD_EOF'
           {
             "repository_name": "${{ github.repository }}",
@@ -171,68 +196,93 @@ jobs:
             "sbom_data": 
           PAYLOAD_EOF
           
-          # Append SBOM data and close JSON
           cat sbom.json >> payload.json
           echo "}" >> payload.json
           
           PAYLOAD_SIZE=$(stat -f%z payload.json 2>/dev/null || stat -c%s payload.json 2>/dev/null)
           echo "📊 Total payload size: $PAYLOAD_SIZE bytes"
           
-          # Retry logic with exponential backoff
-          MAX_RETRIES=3
-          RETRY_DELAY=5
-          ATTEMPT=1
+          # Debug: Show payload structure
+          echo "🔍 Payload structure (first 200 chars):"
+          head -c 200 payload.json | sed 's/[[:space:]]//g' | head -c 200
+          echo "..."
           
-          while [ $ATTEMPT -le $MAX_RETRIES ]; do
+          # Retry logic with exponential backoff
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+          ATTEMPT=1
+          UPLOAD_SUCCESS=0
+          
+          while [ $ATTEMPT -le $MAX_RETRIES ] && [ $UPLOAD_SUCCESS -eq 0 ]; do
             echo ""
-            echo "🔄 Upload attempt $ATTEMPT of $MAX_RETRIES..."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🔄 Upload attempt $ATTEMPT of $MAX_RETRIES"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
-            # GitHub automatically masks the token if it appears in output
-            # Using verbose mode (-v) to debug connection issues
-            HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
+            # Perform upload with detailed debugging
+            HTTP_CODE=$(curl -s -w "%{http_code}" \
               -X POST "${API_URL}/scans/trigger" \
               -H "Authorization: Bearer ${API_TOKEN}" \
               -H "Content-Type: application/json" \
-              --max-time 120 \
+              --max-time 180 \
               --connect-timeout 30 \
-              -v \
-              -d @payload.json 2>&1 | tee curl-debug.log | grep "^< HTTP" | awk '{print $3}')
+              --no-buffer \
+              -d @payload.json \
+              -o response.json 2>&1 | tail -1)
             
-            echo "📊 HTTP Status: $HTTP_CODE"
+            echo "📊 HTTP Status Code: $HTTP_CODE"
+            echo "📊 Response size: $(stat -f%z response.json 2>/dev/null || stat -c%s response.json 2>/dev/null) bytes"
             
-            # Show response if available
+            # Show response content
             if [ -s response.json ]; then
-              echo "📝 Response: $(head -c 500 response.json)"
+              RESPONSE_LENGTH=$(wc -c < response.json)
+              if [ $RESPONSE_LENGTH -lt 1000 ]; then
+                echo "📝 Response body:"
+                cat response.json
+              else
+                echo "📝 Response (first 1000 chars):"
+                head -c 1000 response.json
+                echo "..."
+              fi
             fi
             
             # Check if successful
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
-              echo "✅ SBOM uploaded successfully!"
-              echo "📝 Full response:"
-              cat response.json || true
-              exit 0
+              echo ""
+              echo "✅ SBOM uploaded successfully on attempt $ATTEMPT!"
+              UPLOAD_SUCCESS=1
+              continue
             fi
             
-            # If 504 or 502 or 503, retry
-            if [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ]; then
+            # Handle server errors with retry
+            if [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "408" ]; then
               if [ $ATTEMPT -lt $MAX_RETRIES ]; then
-                echo "⚠️ Server error ($HTTP_CODE), retrying in ${RETRY_DELAY}s..."
+                echo "⚠️ Server error ($HTTP_CODE), waiting ${RETRY_DELAY}s before retry..."
                 sleep $RETRY_DELAY
                 RETRY_DELAY=$((RETRY_DELAY * 2))
                 ATTEMPT=$((ATTEMPT + 1))
                 continue
               fi
-            else
-              # For other errors, don't retry
-              echo "❌ Upload failed with HTTP $HTTP_CODE"
-              echo "📝 Full response:"
-              cat response.json || true
+            fi
+            
+            # Handle client errors or final attempt failure
+            echo "❌ Upload failed with HTTP $HTTP_CODE on attempt $ATTEMPT"
+            
+            if [ $ATTEMPT -eq $MAX_RETRIES ]; then
               echo ""
-              echo "🔍 Debug log:"
-              tail -20 curl-debug.log || true
+              echo "❌ Failed to upload SBOM after $MAX_RETRIES attempts"
+              echo "⚠️ Possible causes:"
+              echo "  - Backend service is unavailable or unreachable"
+              echo "  - Incorrect API endpoint: ${API_URL}/scans/trigger"
+              echo "  - Invalid authentication token"
+              echo "  - Network connectivity issues"
+              echo "  - Request payload format incompatibility"
               exit 1
             fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
           done
           
-          echo "❌ Failed to upload SBOM after $MAX_RETRIES attempts"
-          exit 1
+          if [ $UPLOAD_SUCCESS -eq 1 ]; then
+            echo "✅ SBOM successfully uploaded to backend!"
+          fi
