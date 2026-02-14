@@ -142,25 +142,57 @@ jobs:
           fi
           
           echo "✅ API URL: ${API_URL}"
-          echo "✅ API Token: ${API_TOKEN:0:10}... (masked)"
+          echo "✅ API Token: set (hidden)"
           echo "✅ Repository: ${{ github.repository }}"
           echo "✅ Version: ${{ steps.version.outputs.version }}"
-          
-          # GitHub automatically masks the token if it appears in output
-          curl -X POST "${API_URL}/scans/trigger" \
-            -H "Authorization: Bearer ${API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -f \
-            -w "\nHTTP Status: %{http_code}\n" \
-            -d "{
-              \"repository_name\": \"${{ github.repository }}\",
-              \"version\": \"${{ steps.version.outputs.version }}\",
-              \"git_tag\": \"${{ steps.version.outputs.git_tag }}\",
-              \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\",
-              \"sbom_data\": $(cat sbom.json)
-            }" || {
-              echo "❌ Failed to upload SBOM to backend"
+
+          # Build payload.json safely (use jq when available)
+          if command -v jq &> /dev/null; then
+            jq -n \
+              --arg repository "${{ github.repository }}" \
+              --arg version "${{ steps.version.outputs.version }}" \
+              --arg git_tag "${{ steps.version.outputs.git_tag }}" \
+              --arg git_commit_sha "${{ steps.version.outputs.git_commit_sha }}" \
+              --slurpfile sbom sbom.json \
+              '{repository_name:$repository,version:$version,git_tag:$git_tag,git_commit_sha:$git_commit_sha,sbom_data:$sbom[0]}' \
+              > payload.json || {
+              echo "❌ Failed to create payload.json with jq"
               exit 1
             }
-          
-          echo "✅ SBOM uploaded successfully!"
+          else
+            printf '%s\n' '{' \
+              "  \"repository_name\": \"${{ github.repository }}\"," \
+              "  \"version\": \"${{ steps.version.outputs.version }}\"," \
+              "  \"git_tag\": \"${{ steps.version.outputs.git_tag }}\"," \
+              "  \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\"," \
+              "  \"sbom_data\": " > payload.json
+            cat sbom.json >> payload.json
+            echo "}" >> payload.json
+          fi
+
+          # Upload using file input to avoid long-argument errors
+          HTTP_CODE_FILE=$(mktemp)
+          curl -sS --max-time 180 --connect-timeout 30 -X POST "${API_URL}/scans/trigger" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json -o response.json -w "%{http_code}" >"$HTTP_CODE_FILE" 2>curl.err
+          CURL_EXIT=$?
+          HTTP_CODE=$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "")
+          rm -f "$HTTP_CODE_FILE"
+
+          if [ $CURL_EXIT -ne 0 ]; then
+            echo "❌ curl failed with exit code $CURL_EXIT"
+            echo "-- curl stderr --"
+            sed -n '1,200p' curl.err || true
+            exit 1
+          fi
+
+          echo "HTTP Status: ${HTTP_CODE:-(none)}"
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
+            echo "✅ SBOM uploaded successfully!"
+          else
+            echo "❌ Failed to upload SBOM to backend (HTTP $HTTP_CODE)"
+            echo "-- Response preview --"
+            head -c 200 response.json || true
+            exit 1
+          fi
