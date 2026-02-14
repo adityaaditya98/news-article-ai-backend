@@ -19,15 +19,6 @@ jobs:
       
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0
-
-      - name: Ensure jq is installed
-        run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y jq
-          else
-            echo "jq already installed"
-          fi
       
       - name: Extract version
         id: version
@@ -92,16 +83,19 @@ jobs:
         id: sbom
         run: |
           # Create .syftignore file to exclude non-package directories
-          printf '%s\n' \
-            ".github/" \
-            ".git/" \
-            ".next/" \
-            "out/" \
-            "__pycache__/" \
-            "*.pyc" \
-            ".venv/" \
-            "venv/" \
-            ".env*" > .syftignore
+          cat > .syftignore << EOF
+          .github/
+          .git/
+          .next/
+          out/
+          __pycache__/
+          *.pyc
+          .venv/
+          venv/
+          node_modules/
+          .vscode/
+          .env*
+          EOF
           
           # Scan the entire directory - syft will auto-detect npm packages from package-lock.json
           syft scan dir:. --scope all-layers -o cyclonedx-json > sbom.json 2>syft-warnings.log || {
@@ -148,180 +142,25 @@ jobs:
           fi
           
           echo "✅ API URL: ${API_URL}"
-          echo "✅ API Token: set (hidden)"
+          echo "✅ API Token: ${API_TOKEN:0:10}... (masked)"
           echo "✅ Repository: ${{ github.repository }}"
           echo "✅ Version: ${{ steps.version.outputs.version }}"
           
-          # Test endpoint connectivity first
-          echo ""
-          echo "🔍 Testing endpoint connectivity..."
-          curl -s -o /dev/null -w "Connection test - HTTP Status: %{http_code}\n" \
-            --connect-timeout 10 \
-            --max-time 15 \
-            "${API_URL}/health" || echo "⚠️ Health check endpoint unavailable (expected if not implemented)"
-          
-          # Debug: Check SBOM file structure
-          echo ""
-          echo "📊 SBOM file size: $(du -h sbom.json 2>/dev/null | cut -f1 || echo 'N/A')"
-          echo "📊 SBOM file line count: $(wc -l < sbom.json)"
-          
-          # Check if SBOM is too large and minify
-          SBOM_SIZE=$(stat -f%z sbom.json 2>/dev/null || stat -c%s sbom.json 2>/dev/null)
-          echo "📊 SBOM exact size: $SBOM_SIZE bytes"
-          
-          # Minify SBOM to reduce payload
-          echo "🔧 Minifying SBOM..."
-          jq -c . sbom.json > sbom.min.json
-          mv sbom.min.json sbom.json
-          SBOM_SIZE=$(stat -f%z sbom.json 2>/dev/null || stat -c%s sbom.json 2>/dev/null)
-          echo "📊 Minified SBOM size: $SBOM_SIZE bytes"
-          
-          # Extract only essential SBOM metadata to reduce size further if needed
-          echo "🔧 Creating reduced SBOM with essential components..."
-          jq -c '{
-            "bomFormat": .bomFormat,
-            "specVersion": .specVersion,
-            "version": .version,
-            "metadata": ({
-              "timestamp": (.metadata.timestamp // null),
-              "tools": (.metadata.tools[0:1] // [])
-            } // {}),
-            "components": (.components // [] | if type == "array" then sort_by(.name // "") | .[0:50] else [] end)
-          }' sbom.json > sbom-reduced.json 2>&1 || {
-            echo "⚠️ Failed to create reduced SBOM, using minified full SBOM instead"
-            cp sbom.json sbom-reduced.json
-          }
-          
-          REDUCED_SIZE=$(stat -f%z sbom-reduced.json 2>/dev/null || stat -c%s sbom-reduced.json 2>/dev/null)
-          echo "📊 Reduced SBOM size (first 50 components): $REDUCED_SIZE bytes"
-          
-          # Create full payload (prefer `jq` for safe JSON composition)
-          echo ""
-          echo "🔧 Creating full payload..."
-          if command -v jq &> /dev/null; then
-            jq -n \
-              --arg repository "${{ github.repository }}" \
-              --arg version "${{ steps.version.outputs.version }}" \
-              --arg git_tag "${{ steps.version.outputs.git_tag }}" \
-              --arg git_commit_sha "${{ steps.version.outputs.git_commit_sha }}" \
-              --slurpfile sbom sbom.json \
-              '{repository_name:$repository,version:$version,git_tag:$git_tag,git_commit_sha:$git_commit_sha,sbom_data:$sbom[0]}' \
-              > payload.json || {
-              echo "⚠️ Failed to create payload.json with jq"
+          # GitHub automatically masks the token if it appears in output
+          curl -X POST "${API_URL}/scans/trigger" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -f \
+            -w "\nHTTP Status: %{http_code}\n" \
+            -d "{
+              \"repository_name\": \"${{ github.repository }}\",
+              \"version\": \"${{ steps.version.outputs.version }}\",
+              \"git_tag\": \"${{ steps.version.outputs.git_tag }}\",
+              \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\",
+              \"sbom_data\": $(cat sbom.json)
+            }" || {
+              echo "❌ Failed to upload SBOM to backend"
               exit 1
             }
-          else
-            echo "ℹ️ jq not available - falling back to manual payload assembly"
-            printf '%s\n' '{' \
-              "  \"repository_name\": \"${{ github.repository }}\"," \
-              "  \"version\": \"${{ steps.version.outputs.version }}\"," \
-              "  \"git_tag\": \"${{ steps.version.outputs.git_tag }}\"," \
-              "  \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\"," \
-              "  \"sbom_data\": " > payload.json
-
-            cat sbom.json >> payload.json
-            echo "}" >> payload.json
-          fi
-
-          PAYLOAD_SIZE=$(stat -f%z payload.json 2>/dev/null || stat -c%s payload.json 2>/dev/null || echo "0")
-          echo "📊 Total payload size: $PAYLOAD_SIZE bytes"
-
-          # Validate payload JSON if possible
-          if command -v jq &> /dev/null; then
-            if ! jq empty payload.json 2>/dev/null; then
-              echo "❌ payload.json is not valid JSON"
-              echo "📄 payload.json preview (first 200 chars):"
-              head -c 200 payload.json || true
-              exit 1
-            fi
-          else
-            echo "ℹ️ jq not found; skipping payload JSON validation"
-          fi
-
-          # Debug: Show payload structure (first 200 chars)
-          echo "🔍 Payload structure (first 200 chars):"
-          head -c 200 payload.json | sed 's/[[:space:]]//g' | head -c 200 || true
-          echo "..."
           
-          # Retry logic with exponential backoff
-          MAX_RETRIES=5
-          RETRY_DELAY=10
-          ATTEMPT=1
-          UPLOAD_SUCCESS=0
-          
-          while [ $ATTEMPT -le $MAX_RETRIES ] && [ $UPLOAD_SUCCESS -eq 0 ]; do
-            echo ""
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "🔄 Upload attempt $ATTEMPT of $MAX_RETRIES"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            
-            # Perform upload with reliable HTTP code capture and curl error handling
-            HTTP_CODE_FILE=$(mktemp)
-            curl -sS --max-time 180 --connect-timeout 30 -X POST "${API_URL}/scans/trigger" \
-              -H "Authorization: Bearer ${API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d @payload.json -o response.json -w "%{http_code}" >"$HTTP_CODE_FILE" 2>curl.err
-            CURL_EXIT=$?
-            HTTP_CODE=$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "")
-            rm -f "$HTTP_CODE_FILE"
-
-            if [ $CURL_EXIT -ne 0 ]; then
-              echo "⚠️ curl failed with exit code $CURL_EXIT"
-            fi
-
-            echo "📊 HTTP Status Code: ${HTTP_CODE:-(none)}"
-            echo "📊 Response size: $(stat -f%z response.json 2>/dev/null || stat -c%s response.json 2>/dev/null || echo '0') bytes"
-            
-            # Show response content
-            if [ -s response.json ]; then
-              RESPONSE_LENGTH=$(wc -c < response.json)
-              if [ $RESPONSE_LENGTH -lt 1000 ]; then
-                echo "📝 Response body:"
-                cat response.json
-              else
-                echo "📝 Response (first 1000 chars):"
-                head -c 1000 response.json
-                echo "..."
-              fi
-            fi
-            
-            # Check if successful
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
-              echo ""
-              echo "✅ SBOM uploaded successfully on attempt $ATTEMPT!"
-              UPLOAD_SUCCESS=1
-              continue
-            fi
-            
-            # Handle server errors with retry
-            if [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "408" ]; then
-              if [ $ATTEMPT -lt $MAX_RETRIES ]; then
-                echo "⚠️ Server error ($HTTP_CODE), waiting ${RETRY_DELAY}s before retry..."
-                sleep $RETRY_DELAY
-                RETRY_DELAY=$((RETRY_DELAY * 2))
-                ATTEMPT=$((ATTEMPT + 1))
-                continue
-              fi
-            fi
-            
-            # Handle client errors or final attempt failure
-            echo "❌ Upload failed with HTTP $HTTP_CODE on attempt $ATTEMPT"
-            
-            if [ $ATTEMPT -eq $MAX_RETRIES ]; then
-              echo ""
-              echo "❌ Failed to upload SBOM after $MAX_RETRIES attempts"
-              echo "⚠️ Possible causes:"
-              echo "  - Backend service is unavailable or unreachable"
-              echo "  - Incorrect API endpoint: ${API_URL}/scans/trigger"
-              echo "  - Invalid authentication token"
-              echo "  - Network connectivity issues"
-              echo "  - Request payload format incompatibility"
-              exit 1
-            fi
-            
-            ATTEMPT=$((ATTEMPT + 1))
-          done
-          
-          if [ $UPLOAD_SUCCESS -eq 1 ]; then
-            echo "✅ SBOM successfully uploaded to backend!"
-          fi
+          echo "✅ SBOM uploaded successfully!"
