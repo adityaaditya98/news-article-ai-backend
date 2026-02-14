@@ -144,19 +144,27 @@ jobs:
           echo "✅ Repository: ${{ github.repository }}"
           echo "✅ Version: ${{ steps.version.outputs.version }}"
           
+          # Create payload with SBOM to avoid "Argument list too long" error
+          cat > payload.json << 'PAYLOAD_EOF'
+          {
+            "repository_name": "${{ github.repository }}",
+            "version": "${{ steps.version.outputs.version }}",
+            "git_tag": "${{ steps.version.outputs.git_tag }}",
+            "git_commit_sha": "${{ steps.version.outputs.git_commit_sha }}",
+            "sbom_data": 
+          PAYLOAD_EOF
+          
+          # Append SBOM data and close JSON
+          cat sbom.json >> payload.json
+          echo "}" >> payload.json
+          
           # GitHub automatically masks the token if it appears in output
           curl -X POST "${API_URL}/scans/trigger" \
             -H "Authorization: Bearer ${API_TOKEN}" \
             -H "Content-Type: application/json" \
             -f \
             -w "\nHTTP Status: %{http_code}\n" \
-            -d "{
-              \"repository_name\": \"${{ github.repository }}\",
-              \"version\": \"${{ steps.version.outputs.version }}\",
-              \"git_tag\": \"${{ steps.version.outputs.git_tag }}\",
-              \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\",
-              \"sbom_data\": $(cat sbom.json)
-            }" || {
+            -d @payload.json || {
               echo "❌ Failed to upload SBOM to backend"
               exit 1
             }
