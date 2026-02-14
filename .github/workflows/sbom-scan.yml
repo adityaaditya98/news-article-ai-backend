@@ -170,16 +170,19 @@ jobs:
           
           # Extract only essential SBOM metadata to reduce size further if needed
           echo "🔧 Creating reduced SBOM with essential components..."
-          jq '{
+          jq -c '{
             "bomFormat": .bomFormat,
             "specVersion": .specVersion,
             "version": .version,
-            "metadata": {
-              "timestamp": .metadata.timestamp,
-              "tools": .metadata.tools[0:1]
-            },
-            "components": (.components | sort_by(.name)[:50])
-          }' sbom.json > sbom-reduced.json
+            "metadata": ({
+              "timestamp": (.metadata.timestamp // null),
+              "tools": (.metadata.tools[0:1] // [])
+            } // {}),
+            "components": (.components // [] | if type == "array" then sort_by(.name // "") | .[0:50] else [] end)
+          }' sbom.json > sbom-reduced.json 2>&1 || {
+            echo "⚠️ Failed to create reduced SBOM, using minified full SBOM instead"
+            cp sbom.json sbom-reduced.json
+          }
           
           REDUCED_SIZE=$(stat -f%z sbom-reduced.json 2>/dev/null || stat -c%s sbom-reduced.json 2>/dev/null)
           echo "📊 Reduced SBOM size (first 50 components): $REDUCED_SIZE bytes"
