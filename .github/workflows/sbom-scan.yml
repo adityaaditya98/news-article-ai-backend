@@ -92,17 +92,16 @@ jobs:
         id: sbom
         run: |
           # Create .syftignore file to exclude non-package directories
-          cat > .syftignore << EOF
-          .github/
-          .git/
-          .next/
-          out/
-          __pycache__/
-          *.pyc
-          .venv/
-          venv/
-          .env*
-          EOF
+          printf '%s\n' \
+            ".github/" \
+            ".git/" \
+            ".next/" \
+            "out/" \
+            "__pycache__/" \
+            "*.pyc" \
+            ".venv/" \
+            "venv/" \
+            ".env*" > .syftignore
           
           # Scan the entire directory - syft will auto-detect npm packages from package-lock.json
           syft scan dir:. --scope all-layers -o cyclonedx-json > sbom.json 2>syft-warnings.log || {
@@ -213,14 +212,12 @@ jobs:
             }
           else
             echo "ℹ️ jq not available - falling back to manual payload assembly"
-            cat > payload.json << PAYLOAD_EOF
-{
-  "repository_name": "${{ github.repository }}",
-  "version": "${{ steps.version.outputs.version }}",
-  "git_tag": "${{ steps.version.outputs.git_tag }}",
-  "git_commit_sha": "${{ steps.version.outputs.git_commit_sha }}",
-  "sbom_data": 
-PAYLOAD_EOF
+            printf '%s\n' '{' \
+              "  \"repository_name\": \"${{ github.repository }}\"," \
+              "  \"version\": \"${{ steps.version.outputs.version }}\"," \
+              "  \"git_tag\": \"${{ steps.version.outputs.git_tag }}\"," \
+              "  \"git_commit_sha\": \"${{ steps.version.outputs.git_commit_sha }}\"," \
+              "  \"sbom_data\": " > payload.json
 
             cat sbom.json >> payload.json
             echo "}" >> payload.json
